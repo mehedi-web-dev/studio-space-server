@@ -2,20 +2,79 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import cors from "cors";
+import cookieParser from "cookie-parser";
 import verifyToken from "./joss/verifyToken.js";
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 
+// ========================================
+// TRUSTED ORIGINS
+// ========================================
+// The frontend is expected to call this API through a same-origin Next.js
+// proxy (/api/backend/...), which forwards the Better Auth session cookie.
+// Direct cross-origin requests are only allowed from explicitly trusted
+// origins. No wildcard origins with credentials.
+const frontendURL = process.env.AUTH_BASE_URL || "http://localhost:3000";
+const allowedOrigins = [
+  frontendURL,
+  "http://localhost:3000", // local development
+  process.env.BACKEND_URL, // this backend's own deployment URL
+  ...(process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(",") : []),
+]
+  .filter(Boolean)
+  .map((origin) => origin.replace(/\/$/, ""));
+
+const originsMatch = (origin) => allowedOrigins.includes(origin.replace(/\/$/, ""));
+
+// ----------------------------------------
 // Middleware
+// ----------------------------------------
 app.use(
   cors({
-    origin: "http://localhost:3000",
+    // Untrusted origins get no CORS headers (browser blocks the response)
+    // instead of a CORS error response, keeping the API usable server-side.
+    origin: (origin, callback) => {
+      if (!origin || originsMatch(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    },
     credentials: true,
   }),
 );
 
+app.disable("x-powered-by");
+
 app.use(express.json());
+app.use(cookieParser());
+
+// ----------------------------------------
+// CSRF protection for state-changing requests
+// ----------------------------------------
+// Requests carrying an Origin/Referer from an untrusted origin are rejected.
+// Requests without these headers (curl, server-to-server, the Next.js proxy)
+// are allowed: session cookies live on the frontend domain and are HttpOnly,
+// so the browser-side SameSite policy prevents cross-site cookie attachment.
+const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+app.use((req, res, next) => {
+  if (!UNSAFE_METHODS.has(req.method)) {
+    return next();
+  }
+
+  const origin = req.get("origin") ||
+    (req.get("referer") ? new URL(req.get("referer")).origin : null);
+
+  if (origin && !originsMatch(origin)) {
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden: Untrusted request origin",
+    });
+  }
+
+  return next();
+});
 
 // MongoDB Connection
 const client = new MongoClient(process.env.MONGODB_URI);
@@ -106,6 +165,31 @@ app.get("/api/studios", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch studios",
+    });
+  }
+});
+
+// Get Featured Studios (Latest 6)
+app.get("/api/studios/featured", async (req, res) => {
+  try {
+    const studios = await db
+      .collection("studios")
+      .find()
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      message: "Featured studios fetched successfully",
+      data: studios,
+    });
+  } catch (error) {
+    console.error("Featured studios error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch featured studios",
     });
   }
 });
@@ -386,7 +470,7 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
       });
     }
 
-    // Validate actual calendar date without timezone conversion
+    // Validate actual calendar date
     const [year, month, day] = bookingDate.split("-").map(Number);
 
     const parsedDate = new Date(Date.UTC(year, month - 1, day));
@@ -504,23 +588,18 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
       studioId: studio._id.toString(),
       studioTitle: studio.title,
       studioImage: studio.image,
-
       hostId: studio.host.id,
       hostName: studio.host.name,
-
       userId: req.user.id,
       userName: req.user.name,
       userEmail: req.user.email,
-
       bookingDate,
       startTime,
       endTime,
-
       totalHours,
       hourlyRate: Number(studio.hourlyRate),
       securityDeposit,
       totalAmount,
-
       status: "pending",
       createdAt: new Date(),
     };
@@ -545,8 +624,6 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
     });
   }
 });
-
-
 
 // Get My Bookings
 app.get("/api/bookings/my-bookings", verifyToken, async (req, res) => {
@@ -574,14 +651,11 @@ app.get("/api/bookings/my-bookings", verifyToken, async (req, res) => {
   }
 });
 
-
-
 // Cancel Pending Booking
 app.patch("/api/bookings/:id/cancel", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Validate booking ID
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
@@ -589,7 +663,6 @@ app.patch("/api/bookings/:id/cancel", verifyToken, async (req, res) => {
       });
     }
 
-    // Cancel only the user's own pending booking
     const result = await db.collection("bookings").updateOne(
       {
         _id: new ObjectId(id),
@@ -601,7 +674,7 @@ app.patch("/api/bookings/:id/cancel", verifyToken, async (req, res) => {
           status: "cancelled",
           cancelledAt: new Date(),
         },
-      }
+      },
     );
 
     if (result.matchedCount === 0) {
@@ -625,21 +698,21 @@ app.patch("/api/bookings/:id/cancel", verifyToken, async (req, res) => {
   }
 });
 
+// ========================================
+// SERVER / DATABASE LIFECYCLE
+// ========================================
 
+async function connectDB() {
+  await client.connect();
 
+  db = client.db("studio-space");
 
-
-
-// START SERVER
-
+  console.log("MongoDB connected successfully");
+}
 
 async function startServer() {
   try {
-    await client.connect();
-
-    db = client.db("studio-space");
-
-    console.log("MongoDB connected successfully");
+    await connectDB();
 
     app.listen(PORT, () => {
       console.log(`Server running on http://localhost:${PORT}`);
@@ -650,4 +723,12 @@ async function startServer() {
   }
 }
 
-startServer();
+// Export the Express app for the Vercel serverless handler (api/index.js).
+// app.listen() runs only for local development so the serverless runtime
+// is never asked to start a persistent server.
+export default app;
+export { connectDB, startServer };
+
+if (!process.env.VERCEL) {
+  startServer();
+}

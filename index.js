@@ -83,9 +83,9 @@ const getTodayDate = () => {
   return `${year}-${month}-${day}`;
 };
 
-// ========================================
+
 // HEALTH CHECK
-// ========================================
+
 
 app.get("/api/health", (req, res) => {
   res.status(200).json({
@@ -104,9 +104,9 @@ app.get("/api/protected", verifyToken, (req, res) => {
   });
 });
 
-// ========================================
+
 // STUDIO APIs
-// ========================================
+
 
 // Get My Studio Listings
 app.get("/api/studios/my-listings", verifyToken, async (req, res) => {

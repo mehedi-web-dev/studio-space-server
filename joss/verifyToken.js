@@ -1,26 +1,9 @@
 import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from "jose";
 
-const authBaseURL = process.env.AUTH_BASE_URL || "http://localhost:3000";
-
-// ========================================
-// BETTER AUTH JWT CONFIGURATION (defaults from the Better Auth jwt plugin)
-// ========================================
-//
-// Better Auth (with the JWT plugin) exposes two JWT "flavors":
-//
-// 1. Session-cache JWT (`session_data` cookie, when the frontend uses
-//    `session.cookieCache: { strategy: "jwt" }` + `jwt({ sessionCookieCache: true })`):
-//    - header:   typ = "better-auth.session-cache+jwt"
-//    - payload:  iss = baseURL, aud = "better-auth:session-cache" (constant),
-//                sub = user.id, sid = session token, user = { id, email, name, ... }
-//    (source: better-auth packages/better-auth/src/plugins/jwt/cookie-cache.ts)
-//
-// 2. Token JWT (`/api/auth/token` endpoint / "set-auth-jwt" response header):
-//    - payload:  iss = jwt.issuer ?? baseURL, aud = jwt.audience ?? baseURL,
-//                sub = user.id, email / name as top-level claims
-//    (source: better-auth packages/better-auth/src/plugins/jwt/sign.ts)
-//
-// Both flavors are signed with the key published at /api/auth/jwks.
+// This must point to the Better Auth frontend server.
+const authBaseURL = (
+  process.env.AUTH_BASE_URL || "http://localhost:3000"
+).replace(/\/+$/, "");
 
 const SESSION_CACHE_JWT_TYPE = "better-auth.session-cache+jwt";
 const SESSION_CACHE_JWT_AUDIENCE = "better-auth:session-cache";
@@ -28,40 +11,73 @@ const SESSION_CACHE_JWT_AUDIENCE = "better-auth:session-cache";
 const JWT_ISSUER = process.env.JWT_ISSUER || authBaseURL;
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || authBaseURL;
 
-// Better Auth JWKS endpoint (public keys of the auth server).
+// Better Auth public JWKS endpoint.
 const JWKS = createRemoteJWKSet(new URL("/api/auth/jwks", authBaseURL));
 
-// Matches Better Auth cookie names: "<prefix>.session_data", where the
-// default prefix is "better-auth" (custom prefixes / "__Secure-" supported).
+// Check whether a value has JWT structure.
 const looksLikeJwt = (value) =>
   typeof value === "string" &&
-  value.split(".").length === 3 &&
   /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 
+// Session cookie names issued by Better Auth. With a https baseURL the cookies
+// carry a "__Secure-" prefix, so match on suffixes instead of exact names.
+const isSessionCookieBase = (name) =>
+  name.endsWith(".session_data") || name === "session_data"
+    ? "session_data"
+    : name.endsWith(".session_token") || name === "session_token"
+      ? "session_token"
+      : null;
+
+// Better Auth chunks oversized cookies ("<base>.0", "<base>.1", ...) when a
+// single cookie would exceed the ~4KB browser limit. Split the chunk index
+// off the name so chunked and unchunked cookies can be told apart.
+const matchSessionCookie = (name) => {
+  const chunk = /^(.+)\.(\d+)$/.exec(name);
+
+  if (chunk && isSessionCookieBase(chunk[1]) && isSessionCookieBase(name) === null) {
+    return { base: chunk[1], index: Number(chunk[2]) };
+  }
+
+  const base = isSessionCookieBase(name);
+
+  return base ? { base, index: null } : null;
+};
+
+// Collect possible JWT tokens from cookies and Authorization header.
+// Chunked cookies are reassembled in index order before verification.
 const collectTokenCandidates = (req) => {
   const candidates = [];
+
   const push = (name, value) => {
-    if (looksLikeJwt(value)) candidates.push({ name, value });
+    if (looksLikeJwt(value)) {
+      candidates.push({ name, value });
+    }
   };
 
-  // Cookie candidates prefer the actual JWT session cookie ending in
-  // ".session_data". ".session_token" is normally an opaque Better Auth
-  // session token (token.hmac), so it only qualifies if it looks like a JWT.
-  // Forged values from any other cookie are harmless: they still have to
-  // pass cryptographic verification below.
+  const chunks = new Map();
+
   for (const [name, value] of Object.entries(req.cookies || {})) {
-    if (name.endsWith(".session_data") || name === "session_data") {
-      push(name, value);
-    }
-  }
-  for (const [name, value] of Object.entries(req.cookies || {})) {
-    if (name.endsWith(".session_token") || name === "session_token") {
+    const match = matchSessionCookie(name);
+
+    if (match === null) continue;
+
+    if (match.index !== null) {
+      const parts = chunks.get(match.base) ?? [];
+      parts.push({ index: match.index, value });
+      chunks.set(match.base, parts);
+    } else {
       push(name, value);
     }
   }
 
-  // Optional: allow `Authorization: Bearer <jwt>` (useful for API tests).
+  for (const [base, parts] of chunks) {
+    parts.sort((a, b) => a.index - b.index);
+    push(base, parts.map((part) => part.value).join(""));
+  }
+
+  // Bearer token support.
   const authHeader = req.headers?.authorization;
+
   if (authHeader?.startsWith("Bearer ")) {
     push("authorization", authHeader.slice(7).trim());
   }
@@ -80,27 +96,21 @@ const verifyToken = async (req, res, next) => {
   }
 
   for (const { name, value: token } of candidates) {
-    let header = null;
-
     try {
-      header = decodeProtectedHeader(token);
-    } catch {
-      console.error(`JWT verification failed (cookie "${name}"): malformed token`);
-    }
+      const header = decodeProtectedHeader(token);
 
-    if (!header) {
-      continue; // not a parseable JWS -> try next candidate
-    }
-
-    try {
-      // Issuer / audience depend on the exact Better Auth JWT flavor.
+      // Session-cache JWT and regular JWT use different audiences.
       const verifyOptions =
-        header?.typ === SESSION_CACHE_JWT_TYPE
-          ? { issuer: JWT_ISSUER, audience: SESSION_CACHE_JWT_AUDIENCE }
-          : { issuer: JWT_ISSUER, audience: JWT_AUDIENCE };
+        header.typ === SESSION_CACHE_JWT_TYPE
+          ? {
+              issuer: JWT_ISSUER,
+              audience: SESSION_CACHE_JWT_AUDIENCE,
+            }
+          : {
+              issuer: JWT_ISSUER,
+              audience: JWT_AUDIENCE,
+            };
 
-      // jwtVerify validates the signature (JWKS), exp, nbf, iss and aud.
-      // Missing or expired tokens throw and are rejected below.
       const { payload } = await jwtVerify(token, JWKS, {
         ...verifyOptions,
         clockTolerance: 15,
@@ -118,7 +128,7 @@ const verifyToken = async (req, res, next) => {
         });
       }
 
-      // Only verified claims are exposed downstream.
+      // Expose only verified user information.
       req.user = {
         id: String(userId),
         email: nestedUser.email ?? payload.email ?? null,
@@ -127,9 +137,10 @@ const verifyToken = async (req, res, next) => {
 
       return next();
     } catch (error) {
-      // Try the next candidate; handled after the loop.
       console.error(
-        `JWT verification failed (cookie "${name}"): ${error.name}: ${error.message}`,
+        `JWT verification failed (${name}):`,
+        error.code || error.name,
+        error.message,
       );
     }
   }

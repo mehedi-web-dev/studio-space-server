@@ -8,13 +8,7 @@ import verifyToken from "./joss/verifyToken.js";
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ========================================
-// TRUSTED ORIGINS
-// ========================================
-// The frontend is expected to call this API through a same-origin Next.js
-// proxy (/api/backend/...), which forwards the Better Auth session cookie.
-// Direct cross-origin requests are only allowed from explicitly trusted
-// origins. No wildcard origins with credentials.
+
 const frontendURL = process.env.AUTH_BASE_URL || "http://localhost:3000";
 const allowedOrigins = [
   frontendURL,
@@ -27,13 +21,11 @@ const allowedOrigins = [
 
 const originsMatch = (origin) => allowedOrigins.includes(origin.replace(/\/$/, ""));
 
-// ----------------------------------------
+
 // Middleware
-// ----------------------------------------
+
 app.use(
   cors({
-    // Untrusted origins get no CORS headers (browser blocks the response)
-    // instead of a CORS error response, keeping the API usable server-side.
     origin: (origin, callback) => {
       if (!origin || originsMatch(origin)) {
         return callback(null, true);
@@ -49,13 +41,7 @@ app.disable("x-powered-by");
 app.use(express.json());
 app.use(cookieParser());
 
-// ----------------------------------------
-// CSRF protection for state-changing requests
-// ----------------------------------------
-// Requests carrying an Origin/Referer from an untrusted origin are rejected.
-// Requests without these headers (curl, server-to-server, the Next.js proxy)
-// are allowed: session cookies live on the frontend domain and are HttpOnly,
-// so the browser-side SameSite policy prevents cross-site cookie attachment.
+
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 app.use((req, res, next) => {
